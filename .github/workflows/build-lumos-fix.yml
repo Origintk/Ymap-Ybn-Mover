@@ -1,0 +1,147 @@
+name: Build Ymap Ybn Mover - Lumos Fix
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Setup .NET 9
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '9.0.x'
+
+      - name: Apply Lumos fixes
+        shell: pwsh
+        run: |
+          $path = "MainForm.cs"
+          $src = Get-Content $path -Raw
+
+          # FIX 1: v1.0.6 moves YMAP AllEntities twice.
+          $dupPattern = '(?s)(\s*if \(ymap\.AllEntities != null\)\s*\{\s*foreach \(YmapEntityDef yEnts in ymap\.AllEntities\)\s*yEnts\.SetPosition\(yEnts\.Position \+ moveVector\);\s*\})\s*(if \(ymap\.AllEntities != null\)\s*\{\s*foreach \(YmapEntityDef yEnts in ymap\.AllEntities\)\s*yEnts\.SetPosition\(yEnts\.Position \+ moveVector\);\s*\})'
+
+          $patched = [regex]::Replace($src, $dupPattern, '$1', 1)
+
+          if ($patched -eq $src) {
+            throw "Duplicate YMAP AllEntities block was not found. Source may have changed."
+          }
+
+          $src = $patched
+          Write-Host "OK: duplicate YMAP movement removed."
+
+          # FIX 2: Vector calculator uses invariant culture.
+          # This makes inputs like:
+          # 4889.83, -1053.65, 3.17
+          # work even when Windows is pt-BR.
+          $oldCalc = 'offsetVec = new Vector3\(float\.Parse\(NewLocSplit\[0\]\), float\.Parse\(NewLocSplit\[1\]\), float\.Parse\(NewLocSplit\[2\]\)\) - new Vector3\(float\.Parse\(OldLocSplit\[0\]\), float\.Parse\(OldLocSplit\[1\]\), float\.Parse\(OldLocSplit\[2\]\)\);\s*newOffset\.Text = offsetVec\.X\.ToString\(\) \+ ", " \+ offsetVec\.Y\.ToString\(\) \+ ", " \+ offsetVec\.Z\.ToString\(\);'
+
+          $newCalc = @'
+          var ci = System.Globalization.CultureInfo.InvariantCulture;
+
+          offsetVec = new Vector3(
+              float.Parse(NewLocSplit[0].Trim(), ci),
+              float.Parse(NewLocSplit[1].Trim(), ci),
+              float.Parse(NewLocSplit[2].Trim(), ci)
+          ) - new Vector3(
+              float.Parse(OldLocSplit[0].Trim(), ci),
+              float.Parse(OldLocSplit[1].Trim(), ci),
+              float.Parse(OldLocSplit[2].Trim(), ci)
+          );
+
+          newOffset.Text =
+              offsetVec.X.ToString(ci) + ", " +
+              offsetVec.Y.ToString(ci) + ", " +
+              offsetVec.Z.ToString(ci);
+          '@
+
+          $patchedCalc = [regex]::Replace($src, $oldCalc, $newCalc, 1)
+
+          if ($patchedCalc -eq $src) {
+            Write-Warning "Vector calculator patch was not applied, but the main YMAP movement fix is applied."
+          }
+          else {
+            $src = $patchedCalc
+            Write-Host "OK: vector calculator culture fixed."
+          }
+
+          Set-Content -Path $path -Value $src -Encoding UTF8
+
+      - name: Download original v1.0.6 runtime files
+        shell: pwsh
+        run: |
+          $url = "https://github.com/92-Smallo/Ymap-Ybn-Mover/releases/download/1.0.6/Ymap.Ybn.Mover.v1.0.6.zip"
+
+          Invoke-WebRequest -Uri $url -OutFile "upstream.zip"
+          Expand-Archive -Path "upstream.zip" -DestinationPath "upstream" -Force
+
+          $cw = Get-ChildItem "upstream" -Recurse -Filter "CodeWalker.Core.dll" | Select-Object -First 1
+
+          if (-not $cw) {
+            throw "CodeWalker.Core.dll was not found in the original v1.0.6 package."
+          }
+
+          New-Item -ItemType Directory -Path "lib" -Force | Out-Null
+          Copy-Item $cw.FullName "lib\CodeWalker.Core.dll" -Force
+
+          $projPath = "Ymap Ybn Mover.csproj"
+          $proj = Get-Content $projPath -Raw
+
+          $oldProj = $proj
+          $proj = [regex]::Replace(
+            $proj,
+            '<HintPath>.*?CodeWalker\.Core\.dll</HintPath>',
+            '<HintPath>lib\CodeWalker.Core.dll</HintPath>'
+          )
+
+          if ($proj -eq $oldProj) {
+            throw "Could not replace the absolute CodeWalker.Core.dll HintPath in the csproj."
+          }
+
+          Set-Content -Path $projPath -Value $proj -Encoding UTF8
+          Write-Host "OK: CodeWalker.Core.dll reference configured for GitHub Actions."
+
+      - name: Restore
+        shell: pwsh
+        run: dotnet restore ".\Ymap Ybn Mover.csproj"
+
+      - name: Publish Windows x64
+        shell: pwsh
+        run: |
+          dotnet publish ".\Ymap Ybn Mover.csproj" `
+            -c Release `
+            -r win-x64 `
+            --self-contained true `
+            -p:PublishSingleFile=false `
+            -o ".\publish"
+
+      - name: Create final package
+        shell: pwsh
+        run: |
+          $cw = Get-ChildItem "upstream" -Recurse -Filter "CodeWalker.Core.dll" | Select-Object -First 1
+          $originalFolder = $cw.Directory.FullName
+
+          New-Item -ItemType Directory -Path "package" -Force | Out-Null
+
+          # Keep all companion files from the author's v1.0.6 package.
+          Copy-Item "$originalFolder\*" ".\package\" -Recurse -Force
+
+          # Overlay our fixed compiled build.
+          Copy-Item ".\publish\*" ".\package\" -Recurse -Force
+
+          "Lumos Fix - YMAP entities offset applied only once." |
+            Set-Content ".\package\LUMOS_FIX.txt"
+
+      - name: Upload compiled program
+        uses: actions/upload-artifact@v4
+        with:
+          name: Ymap-Ybn-Mover-v1.0.6-LumosFix
+          path: package
+          retention-days: 7
